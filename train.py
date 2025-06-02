@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from collections import OrderedDict
 import json
-
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,8 @@ import torch.utils.checkpoint
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
+import torchvision
+import torchvision.transforms as T
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -22,9 +24,10 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from sit import SiT_models
 from loss import SILoss
 
-from dataset import LMDBLatentsDataset
-from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+#from dataset import LMDBLatentsDataset
+#from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 import math
+from torch.utils.tensorboard import SummaryWriter
 
 logger = get_logger(__name__)
 
@@ -81,6 +84,9 @@ def main(args):
     )
 
     if accelerator.is_main_process:
+        writer = SummaryWriter(f'./.runs/{datetime.now().strftime("%Y%m%d-%H%M%S")}')
+
+    if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         save_dir = os.path.join(args.output_dir, args.exp_name)
         os.makedirs(save_dir, exist_ok=True)
@@ -106,8 +112,8 @@ def main(args):
         set_seed(args.seed + accelerator.process_index)
     
     # Create model:
-    assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.resolution // 8
+    #assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    latent_size = args.resolution #// 8
     
     # Define block_kwargs from args
     block_kwargs = {
@@ -115,10 +121,12 @@ def main(args):
         "qk_norm": False,
     }
 
+    # Create model with 3 input channels for RGB images
     model = SiT_models[args.model](
         input_size=latent_size,
+        in_channels=3,  # RGB images
         num_classes=args.num_classes,
-        use_cfg = (args.cfg_prob > 0),
+        use_cfg=(args.cfg_prob > 0),
         **block_kwargs
     )
 
@@ -126,7 +134,7 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     
-    # Create loss function with all MeanFlow parameters
+    # Create loss function
     loss_fn = SILoss(
         path_type=args.path_type, 
         # Add MeanFlow specific parameters
@@ -159,8 +167,18 @@ def main(args):
         eps=args.adam_epsilon,
     )    
     
-    # Setup data:
-    train_dataset = LMDBLatentsDataset(args.data_dir, flip_prob=0.5)
+    # Setup CIFAR-10 dataset
+    #train_dataset = LMDBLatentsDataset(args.data_dir, flip_prob=0.5)
+    train_dataset = torchvision.datasets.CIFAR10(
+        root=args.data_dir,
+        train=True,
+        download=True,
+        transform=T.Compose([
+            T.RandomHorizontalFlip(),
+            T.ToTensor(),  # Converts a PIL Image or numpy.ndarray (H x W x C) in the range [0, 255] to a torch.FloatTensor of shape (C x H x W) in the range [0.0, 1.0] 
+            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # [0, 1] -> [-1, +1]
+        ]),
+    )
     local_batch_size = int(args.batch_size // accelerator.num_processes)
     train_dataloader = DataLoader(
         train_dataset,
@@ -171,7 +189,8 @@ def main(args):
         drop_last=True
     )
     if accelerator.is_main_process:
-        logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_dir})")
+        logger.info(f"Dataset contains {len(train_dataset):,} images")
+        
     steps_per_epoch = len(train_dataloader) // accelerator.gradient_accumulation_steps
     args.max_train_steps = args.epochs * steps_per_epoch // accelerator.num_processes
     # Prepare models for training:
@@ -204,22 +223,22 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
     # here is a trick from IMM. https://github.com/lumalabs/imm/blob/main/training/encoders.py
-    latents_scale = torch.tensor(
-        [0.18125, 0.18125, 0.18125, 0.18125]
-        ).view(1, 4, 1, 1).to(device)
-    latents_bias = torch.tensor(
-        [0., 0., 0., 0.]
-        ).view(1, 4, 1, 1).to(device)
+    #latents_scale = torch.tensor(
+    #    [0.18125, 0.18125, 0.18125, 0.18125]
+    #    ).view(1, 4, 1, 1).to(device)
+    #latents_bias = torch.tensor(
+    #    [0., 0., 0., 0.]
+    #    ).view(1, 4, 1, 1).to(device)
+
+    grad_norm = torch.tensor(0.0).to(device)
     for epoch in range(args.epochs):
         model.train()
-        for moments, labels in train_dataloader:
-            moments = moments.to(device, non_blocking=True)
+        for images, labels in train_dataloader:
+            images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            with torch.no_grad():
-                posterior = DiagonalGaussianDistribution(moments)
-                x = posterior.sample()
-                x = x * latents_scale + latents_bias
+            # Directly use images (pixel values) as input
+            x = images
             
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
@@ -259,7 +278,11 @@ def main(args):
                 "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
             }
             progress_bar.set_postfix(**logs)
-            
+
+            if accelerator.is_main_process:
+                writer.add_scalar("train/loss", logs["loss"], global_step)
+                writer.add_scalar("train/grad_norm", logs["grad_norm"], global_step)
+                        
             # Log to file periodically
             if accelerator.is_main_process and global_step % 100 == 0:
                 logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
@@ -290,11 +313,11 @@ def parse_args(input_args=None):
 
     # model
     parser.add_argument("--model", type=str, default="SiT-XL/2")
-    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--num-classes", type=int, default=10)  # CIFAR-10 has 10 classes
 
     # dataset
-    parser.add_argument("--data-dir", type=str, default="/data/train_sdvae_latents_lmdb")
-    parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--data-dir", type=str, default="./data/cifar")
+    parser.add_argument("--resolution", type=int, default=32)  # CIFAR-10 resolution is 32x32
     parser.add_argument("--batch-size", type=int, default=256)
 
     # precision
@@ -304,7 +327,7 @@ def parse_args(input_args=None):
     # optimization
     parser.add_argument("--epochs", type=int, default=240)
     parser.add_argument("--max-train-steps", type=int, default=None)
-    parser.add_argument("--checkpointing-steps", type=int, default=50000)
+    parser.add_argument("--checkpointing-steps", type=int, default=10000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
@@ -316,7 +339,7 @@ def parse_args(input_args=None):
     # seed
     parser.add_argument("--seed", type=int, default=0)
 
-    # cpu
+    # cpu dataloader
     parser.add_argument("--num-workers", type=int, default=4)
 
     # basic loss

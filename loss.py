@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import torch.func
+from scipy.optimize import linear_sum_assignment
 
 class SILoss:
     def __init__(
@@ -110,6 +111,27 @@ class SILoss:
         r, t = self.sample_time_steps(batch_size, device)
 
         noises = torch.randn_like(images)
+
+        ############################################## BEGIN IMMISCIBLE PAIRING INSERTION ##############################################
+        # Sample a full batch of Gaussian noises
+        noises = torch.randn_like(images)
+
+        # 1. Flatten images and noises to shape [B, D]
+        flat_x = images.flatten(1)      # [B, H*W*C]
+        flat_e = noises.flatten(1)      # [B, H*W*C]
+
+        # 2. Compute pairwise L2 cost on GPU, move to CPU
+        cost = torch.cdist(flat_x, flat_e).cpu()      # [B, B] 
+
+        # 3. Solve Hungarian assignment on CPU
+        _, col_idx = linear_sum_assignment(cost.numpy())
+        # row_idx is [0,1,...,B-1] because we want to match each image in order;
+        # col_idx[j] tells which noise-index matches image j.
+
+        # 4. Reorder noises so that noises[col_idx[j]] → images[j]
+        reorder_indices = torch.from_numpy(col_idx).long().to(device)  # shape [B]
+        noises = noises[reorder_indices]
+        ############################################## END IMMISCIBLE PAIRING INSERTION ##############################################
         
         # Calculate interpolation and z_t
         alpha_t, sigma_t, d_alpha_t, d_sigma_t = self.interpolant(t.view(-1, 1, 1, 1))
