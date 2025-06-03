@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 import torchvision
 import torchvision.transforms as T
-
+from meanflow_sampler import meanflow_sampler
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -65,6 +65,29 @@ def requires_grad(model, flag=True):
     """
     for p in model.parameters():
         p.requires_grad = flag
+
+
+@torch.no_grad()
+def generate_sample_grid(model, device, num_samples=25, resolution=32, cfg_scale=1.0):
+    """
+    Generate a grid of samples using the model
+    """
+    # Generate random noise
+    z = torch.randn(num_samples, 1, resolution, resolution, device=device)
+    
+    # Create labels - generate one sample per class (0-9)
+    y = torch.arange(0, 10, device=device).repeat(num_samples // 10 + 1)[:num_samples]
+    
+    # Generate samples in one step
+    samples = meanflow_sampler(model, z, y=y, cfg_scale=cfg_scale, num_steps=1)
+    
+    # Convert from [-1, 1] to [0, 1]
+    samples = (samples + 1) / 2
+    samples = samples.clamp(0, 1)
+    
+    # Create grid
+    grid = torchvision.utils.make_grid(samples, nrow=5, padding=2, normalize=False)
+    return grid
 
 #################################################################################
 #                                  Training Loop                                #
@@ -124,7 +147,7 @@ def main(args):
     # Create model with 3 input channels for RGB images
     model = SiT_models[args.model](
         input_size=latent_size,
-        in_channels=3,  # RGB images
+        in_channels=1,  # RGB images
         num_classes=args.num_classes,
         use_cfg=(args.cfg_prob > 0),
         **block_kwargs
@@ -168,17 +191,30 @@ def main(args):
     )    
     
     # Setup CIFAR-10 dataset
-    #train_dataset = LMDBLatentsDataset(args.data_dir, flip_prob=0.5)
-    train_dataset = torchvision.datasets.CIFAR10(
+    # train_dataset = LMDBLatentsDataset(args.data_dir, flip_prob=0.5)
+
+    # train_dataset = torchvision.datasets.CIFAR10(
+    #     root=args.data_dir,
+    #     train=True,
+    #     download=True,
+    #     transform=T.Compose([
+    #         T.RandomHorizontalFlip(),
+    #         T.ToTensor(),  # Converts a PIL Image or numpy.ndarray (H x W x C) in the range [0, 255] to a torch.FloatTensor of shape (C x H x W) in the range [0.0, 1.0] 
+    #         T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # [0, 1] -> [-1, +1]
+    #     ]),
+    # )
+    train_dataset = torchvision.datasets.MNIST(
         root=args.data_dir,
         train=True,
         download=True,
         transform=T.Compose([
+            T.Resize(32),  # 将28x28上采样到32x32
             T.RandomHorizontalFlip(),
-            T.ToTensor(),  # Converts a PIL Image or numpy.ndarray (H x W x C) in the range [0, 255] to a torch.FloatTensor of shape (C x H x W) in the range [0.0, 1.0] 
-            T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) # [0, 1] -> [-1, +1]
+            T.ToTensor(),
+            T.Normalize([0.5], [0.5])  # 单通道归一化
         ]),
     )
+    
     local_batch_size = int(args.batch_size // accelerator.num_processes)
     train_dataloader = DataLoader(
         train_dataset,
@@ -205,6 +241,7 @@ def main(args):
         ckpt = torch.load(
             f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
             map_location='cpu',
+            weights_only=True
             )
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
@@ -259,14 +296,36 @@ def main(args):
             
             if accelerator.sync_gradients:
                 progress_bar.update(1)
-                global_step += 1                
+                global_step += 1
+                
+            # Generate samples every 100 steps
+            if accelerator.is_main_process and global_step % 100 == 0:                
+                # Generate sample grid
+                sample_grid = generate_sample_grid(
+                    ema, 
+                    device, 
+                    num_samples=25, 
+                    resolution=args.resolution,
+                    cfg_scale=args.cfg_omega
+                )
+                
+                # Add to TensorBoard
+                writer.add_image('samples', sample_grid, global_step)
+                
+                # Save as PNG for reference
+                sample_image = T.ToPILImage()(sample_grid.cpu())
+                sample_path = os.path.join(save_dir, f"samples_step_{global_step:07d}.png")
+                sample_image.save(sample_path)
+                logger.info(f"Saved sample grid to {sample_path}")
+
+
             if global_step % args.checkpointing_steps == 0 and global_step > 0 or global_step >= args.max_train_steps:
                 if accelerator.is_main_process:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": accelerator.get_state_dict(model),
                         "ema": ema.state_dict(),
                         "opt": optimizer.state_dict(),
-                        "args": args,
+                        "args": vars(args),  # dict
                         "steps": global_step,
                     }
                     checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
@@ -329,7 +388,7 @@ def parse_args(input_args=None):
     parser.add_argument("--max-train-steps", type=int, default=None)
     parser.add_argument("--checkpointing-steps", type=int, default=10000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--adam-beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam-beta2", type=float, default=0.95, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam-weight-decay", type=float, default=0., help="Weight decay to use.")

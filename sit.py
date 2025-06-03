@@ -334,10 +334,14 @@ def SiT_B_4(**kwargs):
     return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
 
+def SiT_T_2(**kwargs):
+    return SiT(depth=6, hidden_size=256, decoder_hidden_size=256, patch_size=2, num_heads=8, **kwargs)
+
 SiT_models = {
     'SiT-XL/2': SiT_XL_2,
     'SiT-L/2':  SiT_L_2,
     'SiT-B/2':  SiT_B_2,
-    'SiT-B/4':  SiT_B_4
+    'SiT-B/4':  SiT_B_4,
+    'SiT-T/2':  SiT_T_2
 }
 
